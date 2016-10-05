@@ -5,11 +5,13 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/cloudsight/cloudsight-go"
+	"github.com/parnurzeal/gorequest"
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 )
@@ -20,6 +22,7 @@ type Config struct {
 	DatabaseName     string
 	NumOfDays        int
 	Debug            bool
+	SlackChannel     string
 }
 
 const (
@@ -46,6 +49,10 @@ type FileDataType struct {
 	Key DefaultVersionFile `json:"default"`
 }
 
+type SlackMessage struct {
+	Text string `json:"text"`
+}
+
 var doneChannel chan bool
 var config Config
 var cloudsightClient *cloudsight.Client
@@ -64,11 +71,14 @@ func main() {
 	currentTime := time.Now()
 	startDate = currentTime.AddDate(0, 0, config.NumOfDays)
 
+	PostToSlackChannel("[Cloudsight Sync] Started")
+
 	go Process()
 
 	if <-doneChannel {
 		log.Println("All Queries Completed")
 		log.Println(time.Since(currentTime))
+		PostToSlackChannel("[Cloudsight Sync] Completed")
 	}
 }
 
@@ -97,6 +107,8 @@ func Process() {
 
 	totalJobs := FindPendingJobs(mongoSession)
 
+	PostToSlackChannel("[Cloudsight Sync] Pending Jobs -> " + strconv.Itoa(totalJobs))
+
 	go RunInBatches(jobsChannel, mongoSession, totalJobs)
 
 	for message := range jobsChannel {
@@ -105,9 +117,23 @@ func Process() {
 		if completedJobs >= totalJobs {
 			log.Printf("Total Jobs: %d\n", totalJobs)
 			log.Printf("Completed Jobs: %d\n", completedJobs)
+			PostToSlackChannel("[Cloudsight Sync] Completed Jobs -> " + strconv.Itoa(completedJobs))
 			close(jobsChannel)
 			doneChannel <- true
 		}
+	}
+}
+
+func PostToSlackChannel(msg string) {
+	request := gorequest.New()
+	msgJson := SlackMessage{Text: msg}
+
+	resp, body, errs := request.Post(config.SlackChannel).Send(msgJson).End()
+	if errs != nil {
+		log.Fatalf("%s: %s", "Error while posting to Slack", errs)
+		log.Println("Response : ", resp)
+		log.Println("Response Body: ", body)
+		return
 	}
 }
 
@@ -136,15 +162,10 @@ func RunInBatches(jobsChannel chan int, mongoSession *mgo.Session, totalJobs int
 	collection := sessionCopy.DB(config.DatabaseName).C("products")
 
 	var products []Product
-	var cloudsightErr error
-
-	cloudsightClient, cloudsightErr = cloudsight.NewClientSimple(config.CloudsightApiKey)
-	failOnError(cloudsightErr, "Error while creating CloughtSight Client")
+	cloudsightClient, _ = cloudsight.NewClientSimple(config.CloudsightApiKey)
 
 	offset := 0
 	limit := 1 // Running one product at a time due to cloudsight api rate limits :(
-
-	log.Println(totalJobs)
 
 	for i := 0; i <= (totalJobs / limit); i++ {
 		err := collection.Find(bson.M{"created_at": bson.M{"$gte": startDate}}).Limit(limit).Skip(offset).All(&products)
@@ -256,6 +277,7 @@ func syncWithCloudsight(product Product, mongoSession *mgo.Session, jobsChannel 
 func failOnError(err error, msg string) {
 	if err != nil {
 		log.Fatalf("%s: %s", msg, err)
+		PostToSlackChannel("[Cloudsight Sync] Error: " + msg)
 		doneChannel <- true
 	}
 }
