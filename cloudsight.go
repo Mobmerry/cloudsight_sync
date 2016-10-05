@@ -76,8 +76,10 @@ func main() {
 	go Process()
 
 	if <-doneChannel {
+		totalTime := time.Since(currentTime)
 		log.Println("All Queries Completed")
-		log.Println(time.Since(currentTime))
+		log.Println("Total Time - " + totalTime.String())
+		PostToSlackChannel("[Cloudsight Sync] Time Elapsed -> " + totalTime.String())
 		PostToSlackChannel("[Cloudsight Sync] Completed")
 	}
 }
