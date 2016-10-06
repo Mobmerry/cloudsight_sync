@@ -20,13 +20,14 @@ type Config struct {
 	CloudsightApiKey string
 	MongoServer      string
 	DatabaseName     string
-	NumOfDays        int
 	Debug            bool
 	SlackChannel     string
 }
 
 const (
-	ImageBaseUrl = "http://cloudfront.mobmerry.com/store/"
+	ImageBaseUrl      = "http://cloudfront.mobmerry.com/store/"
+	ProductCollection = "products"
+	PictureCollection = "pictures"
 )
 
 type Product struct {
@@ -56,7 +57,6 @@ type SlackMessage struct {
 var doneChannel chan bool
 var config Config
 var cloudsightClient *cloudsight.Client
-var startDate time.Time
 
 func main() {
 	numCPUs := runtime.NumCPU()
@@ -67,12 +67,9 @@ func main() {
 	}
 
 	doneChannel = make(chan bool)
-
 	currentTime := time.Now()
-	startDate = currentTime.AddDate(0, 0, config.NumOfDays)
 
 	PostToSlackChannel("[Cloudsight Sync] Started")
-
 	go Process()
 
 	if <-doneChannel {
@@ -86,9 +83,11 @@ func main() {
 
 func Process() {
 	mongoDBDialInfo := &mgo.DialInfo{
-		Addrs:    []string{config.MongoServer},
-		Timeout:  60 * time.Second,
-		Database: config.DatabaseName,
+		Addrs:     []string{config.MongoServer},
+		Timeout:   60 * time.Second,
+		Database:  config.DatabaseName,
+		Direct:    true,
+		PoolLimit: 100,
 	}
 
 	// Create a session which maintains a pool of socket connections
@@ -109,6 +108,7 @@ func Process() {
 
 	totalJobs := FindPendingJobs(mongoSession)
 
+	log.Printf("%s: %v", "Total Pending", totalJobs)
 	PostToSlackChannel("[Cloudsight Sync] Pending Jobs -> " + strconv.Itoa(totalJobs))
 
 	go RunInBatches(jobsChannel, mongoSession, totalJobs)
@@ -143,11 +143,11 @@ func FindPendingJobs(mongoSession *mgo.Session) int {
 	sessionCopy := mongoSession.Copy()
 	defer sessionCopy.Close()
 
-	collection := sessionCopy.DB(config.DatabaseName).C("pictures")
+	collection := sessionCopy.DB(config.DatabaseName).C(ProductCollection)
 
 	var totalJobs int
 
-	totalJobs, err := collection.Find(bson.M{"image_resource_type": "Product", "created_at": bson.M{"$gte": startDate}}).Count()
+	totalJobs, err := collection.Find(bson.M{"cloudsight_sync_at": bson.M{"$eq": nil}}).Count()
 
 	if err != nil {
 		log.Fatalf("%s: %s", "TotalPendingJobs Error", err)
@@ -161,7 +161,7 @@ func RunInBatches(jobsChannel chan int, mongoSession *mgo.Session, totalJobs int
 	sessionCopy := mongoSession.Copy()
 	defer sessionCopy.Close()
 
-	collection := sessionCopy.DB(config.DatabaseName).C("products")
+	collection := sessionCopy.DB(config.DatabaseName).C(ProductCollection)
 
 	var products []Product
 	cloudsightClient, _ = cloudsight.NewClientSimple(config.CloudsightApiKey)
@@ -170,7 +170,7 @@ func RunInBatches(jobsChannel chan int, mongoSession *mgo.Session, totalJobs int
 	limit := 1 // Running one product at a time due to cloudsight api rate limits :(
 
 	for i := 0; i <= (totalJobs / limit); i++ {
-		err := collection.Find(bson.M{"created_at": bson.M{"$gte": startDate}}).Limit(limit).Skip(offset).All(&products)
+		err := collection.Find(bson.M{"cloudsight_sync_at": bson.M{"$eq": nil}}).Limit(limit).Skip(offset).All(&products)
 
 		if err != nil {
 			log.Fatalf("%s: %s", "RunQuery Error", err)
@@ -216,8 +216,8 @@ func syncWithCloudsight(product Product, mongoSession *mgo.Session, jobsChannel 
 	sessionCopy := mongoSession.Copy()
 	defer sessionCopy.Close()
 
-	pictureCollection := sessionCopy.DB(config.DatabaseName).C("pictures")
-	productCollection := sessionCopy.DB(config.DatabaseName).C("products")
+	pictureCollection := sessionCopy.DB(config.DatabaseName).C(PictureCollection)
+	productCollection := sessionCopy.DB(config.DatabaseName).C(ProductCollection)
 
 	log.Printf("Running For Product ID : %s\n", product.ID)
 
@@ -226,6 +226,7 @@ func syncWithCloudsight(product Product, mongoSession *mgo.Session, jobsChannel 
 		log.Fatalf("%s: %s", "Error while finding Picture", err)
 		jobsChannel <- 1
 		batchCountChannel <- 1
+		return
 	}
 
 	fileDataInBytes := []byte(picture.FileData)
@@ -246,17 +247,17 @@ func syncWithCloudsight(product Product, mongoSession *mgo.Session, jobsChannel 
 
 	job, err := cloudsightClient.RemoteImageRequest(imageUrl, params)
 	if err != nil {
-		log.Fatalf("%s: %s", "Cloudsight Error", err)
-		jobsChannel <- 1
+		log.Fatalf("%s: %s", "Cloudsight Image Request Error", err)
 		batchCountChannel <- 1
+		jobsChannel <- 1
 		return
 	}
 
-	err = cloudsightClient.WaitJob(job, 15*time.Second)
+	err = cloudsightClient.WaitJob(job, 30*time.Second)
 	if err != nil {
-		log.Fatalf("%s: %s", "Cloudsight Error", err)
-		jobsChannel <- 1
+		log.Fatalf("%s: %s", "Cloudsight Image Response Error", err)
 		batchCountChannel <- 1
+		jobsChannel <- 1
 		return
 	}
 
@@ -267,7 +268,7 @@ func syncWithCloudsight(product Product, mongoSession *mgo.Session, jobsChannel 
 	log.Printf("Job Name : %v\n", job.Name)
 
 	imageTags := strings.Fields(job.Name)
-	err = productCollection.Update(bson.M{"_id": product.ID}, bson.M{"$addToSet": bson.M{"tags": bson.M{"$each": imageTags}}, "$set": bson.M{"updated_at": time.Now()}})
+	err = productCollection.Update(bson.M{"_id": product.ID}, bson.M{"$addToSet": bson.M{"tags": bson.M{"$each": imageTags}}, "$set": bson.M{"cloudsight_sync_at": time.Now()}})
 	if err != nil {
 		log.Fatalf("%s: %s", "Error while updating Product", err)
 	}
